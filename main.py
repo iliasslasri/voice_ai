@@ -1,15 +1,20 @@
 import queue
 import librosa
-
+import time
 import numpy as np
 import sounddevice as sd
 import torch
 from pyannote.audio import Pipeline
 import collections
+import wave
+from pyannoteai.sdk import Client
 
 SAMPLE_RATE = 48000
 CHUNK_DURATION = 2.0 # How to choose this
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
+THRESHOLD = 0.01    # Voice detection threshold
+RECORD_SECONDS = 5  # 5 second recording for voiceprint acquisition
+access_key = 'sk_7e7cf9e9186c464bb8fe489b0c21af44'
 overlap_duration = 0.5 # min duration of overlap to run the separation
 
 class DeMixer:
@@ -27,6 +32,7 @@ class DeMixer:
 
         print(f"Pipeline ready on {self.device}")
         self.target_speaker = None
+        self.client = Client(access_key)
 
     def get_diarization(self, audio_buffer):
         """
@@ -65,12 +71,14 @@ class DeMixer:
         audio_16k = librosa.resample(audio_data, orig_sr=48000, target_sr=16000)
         diarization = self.get_diarization(audio_16k)
         
-        ####################################################
-        ####### SOME LOGIC TO DEFINE THE MAIN SPEAKER ######
-        ####################################################
-        if self.target_speaker is None:
-            self.target_speaker = None
-            print(f"LOCKED onto Speaker: {self.target_speaker}")
+        # ####################################################
+        # ####### SOME LOGIC TO DEFINE THE MAIN SPEAKER ######
+        # ####################################################
+        # if self.target_speaker is None:
+        #     self.target_speaker = None
+        #     print(f"LOCKED onto Speaker: {self.target_speaker}")
+        # else:
+        #     self.detect_speaker(diarization)
 
         # Build the Mask
         # We want to keep Target, but process the frames where Target AND Others speak (seperation etc)
@@ -131,6 +139,34 @@ def main():
 
     print(f"\nUsing Devices -> In: {INPUT_DEV}, Out: {OUTPUT_DEV}")
     print("\n--- LISTENING ---")
+
+    
+    # Get speaker voiceprint 
+    callback.start_time = None
+    TEMP_FILE = "main_speaker.wav"
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback, dtype="float32"):
+        sd.sleep(60_000)  # maximum wait 60 seconds for a speaker
+    audio_np = np.concatenate(recorded_audio, axis=0)
+    # Save temporary WAV
+    wav_file = wave.open(TEMP_FILE, 'w')
+    wav_file.setnchannels(1)
+    wav_file.setsampwidth(2)  # 16-bit PCM
+    wav_file.setframerate(SAMPLE_RATE)
+    # Convert float32 -> int16
+    audio_int16 = np.int16(audio_np * 32767)
+    wav_file.writeframes(audio_int16.tobytes())
+    wav_file.close()
+
+    # Upload audio
+    media_url = DeMixer.client.upload(TEMP_FILE)
+    # Submit embedding job
+    job_id = DeMixer.client.voiceprint(media_url)
+    # Retrieve embedding
+    embedding_result = DeMixer.client.retrieve(job_id)
+    # speaker_embed variable
+    DeMixer.target_speaker = embedding_result['output']['voiceprint']
+
     with sd.Stream(
         device=(INPUT_DEV, OUTPUT_DEV),
         samplerate=SAMPLE_RATE,
@@ -163,6 +199,24 @@ def main():
             ###############################################
             q_out.put(cleaned_audio[-CHUNK_SIZE:])
 
+
+def detect_voice(indata):
+    """Return True if voice is detected in the frame"""
+    volume_norm = np.linalg.norm(indata) / len(indata)
+    return volume_norm > THRESHOLD
+
+def callback(indata, frames, time_info, status):
+    global recorded_audio, recording_started
+    if detect_voice(indata) and not recording_started:
+        print("Speaker detected! Starting 10-second recording...")
+        recording_started = True
+        recorded_audio.append(indata.copy())
+        callback.start_time = time.time()
+    elif recording_started:
+        recorded_audio.append(indata.copy())
+        # Stop after 10 seconds
+        if time.time() - callback.start_time >= RECORD_SECONDS:
+            raise sd.CallbackStop()
 
 if __name__ == "__main__":
     main()
