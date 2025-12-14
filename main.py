@@ -43,28 +43,28 @@ class DeMixer:
     def repair_segment(self, audio_chunk, overlap_mask):
         """
         Only separats the parts where ovelap mask is 1.
-        
+
         Args:
             audio_chunk: The raw audio data.
             overlap_mask: Boolean array where True = overlapping speech.
 
         """
-        
+
         ######################################
         ########### SEPARATION ###############
         ######################################
         # After separation how to find the skpeaker we want to keep
-        
+
         # Mute the overlapping parts (naive approach)
         clean_audio = audio_chunk * (1 - overlap_mask)
-        
+
         return clean_audio
 
     def process_chunk(self, audio_data):
         audio_data = np.ascontiguousarray(audio_data)
         audio_16k = librosa.resample(audio_data, orig_sr=48000, target_sr=16000)
         diarization = self.get_diarization(audio_16k)
-        
+
         ####################################################
         ####### SOME LOGIC TO DEFINE THE MAIN SPEAKER ######
         ####################################################
@@ -77,12 +77,48 @@ class DeMixer:
         # Or remove frames where ONLY Others speak.
 
         n_samples = len(audio_data)
-        overlap_mask = np.zeros(n_samples)
+        overlap_mask = np.zeros(n_samples, dtype=np.float32)
 
         #####################################
         ### BUILD THE MASK ? ################
         #####################################
+        speaker_count = np.zeros(n_samples, dtype=np.int8)
+        segments = []
+        for turn, speaker in diarization.speaker_diarization:
+            segments.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker
+            })
+        for i, seg_i in enumerate(segments):
+            # only overlaps involving target speaker
+            if seg_i["speaker"] != self.target_speaker:
+                continue
 
+            for j, seg_j in enumerate(segments):
+                if i == j:
+                    continue
+
+                # must be a different speaker
+                if seg_j["speaker"] == self.target_speaker:
+                    continue
+
+                # intersection
+                overlap_start = max(seg_i["start"], seg_j["start"])
+                overlap_end = min(seg_i["end"], seg_j["end"])
+
+                if overlap_start >= overlap_end:
+                    continue  # no overlap
+
+                start_sample = int(overlap_start * SAMPLE_RATE)
+                end_sample = int(overlap_end * SAMPLE_RATE)
+
+                start_sample = max(0, start_sample)
+                end_sample = min(n_samples, end_sample)
+
+                overlap_mask[start_sample:end_sample] = 1.0
+
+        assert len(overlap_mask) == len(audio_data)
         final_audio = self.repair_segment(audio_data, overlap_mask)
 
         return final_audio
@@ -113,7 +149,7 @@ def main():
 
     devices = sd.query_devices()
     default_input = sd.default.device[0]
-    
+
     print("\n--- Available Devices ---")
     print(devices)
     print(f"\nUsing Input Device Index: {default_input}")
