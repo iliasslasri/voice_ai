@@ -81,6 +81,7 @@ class DeMixer:
         if self.target_speaker is None:
             self.target_speaker = None
             print(f"LOCKED onto Speaker: {self.target_speaker}")
+        # should give the target speaker id
 
         # Build the Mask
         # We want to keep Target, but process the frames where Target AND Others speak (seperation etc)
@@ -92,39 +93,53 @@ class DeMixer:
         #####################################
         ### BUILD THE MASK ? ################
         #####################################
+        # get number of different ids
+        list_num_speakers = list(seg_i["speaker"] for seg_i in segments)
+        num_speakers = torch.tensor(list_num_speakers).unique().size(0)
 
         for i, seg_i in enumerate(segments):
-            # only overlaps involving target speaker
+            # 1. Filter: We only care about our Target Speaker
             if seg_i["speaker"] != self.target_speaker:
                 continue
 
+            t_start = int(seg_i["start"] * SAMPLE_RATE)
+            t_end = int(seg_i["end"] * SAMPLE_RATE)
+
+            t_start = max(0, t_start)
+            t_end = min(n_samples, t_end)
+
+            overlap_mask[t_start:t_end] = 2.0
+
+            # Check for overlaps with other speakers
             for j, seg_j in enumerate(segments):
                 if i == j:
                     continue
 
-                # must be a different speaker
+                # We only care if the OTHER segment is a different speaker
                 if seg_j["speaker"] == self.target_speaker:
                     continue
 
-                # intersection
+                # Calculate Intersection
                 overlap_start = max(seg_i["start"], seg_j["start"])
                 overlap_end = min(seg_i["end"], seg_j["end"])
 
                 if overlap_start >= overlap_end:
-                    continue  # no overlap
+                    continue
 
-                start_sample = int(overlap_start * SAMPLE_RATE)
-                end_sample = int(overlap_end * SAMPLE_RATE)
+                # Convert to samples
+                o_start_sample = int(overlap_start * SAMPLE_RATE)
+                o_end_sample = int(overlap_end * SAMPLE_RATE)
 
-                start_sample = max(0, start_sample)
-                end_sample = min(n_samples, end_sample)
+                o_start_sample = max(0, o_start_sample)
+                o_end_sample = min(n_samples, o_end_sample)
 
-                overlap_mask[start_sample:end_sample] = 1.0
+                # This takes precedence over the '2' we set earlier
+                overlap_mask[o_start_sample:o_end_sample] = 1.0
 
         assert len(overlap_mask) == len(audio_data)
         final_audio = self.repair_segment(audio_data, overlap_mask)
 
-        return final_audio
+        return final_audio, overlap_mask, num_speakers
 
 
 # --- AUDIO I/O ---
