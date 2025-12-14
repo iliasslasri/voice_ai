@@ -7,6 +7,12 @@ import torch
 from pyannote.audio import Pipeline
 import collections
 
+from pyannoteai.sdk import Client
+
+import os
+
+key_diarization = os.getenv('KEYPYANNOTE', default=None)
+
 SAMPLE_RATE = 48000
 CHUNK_DURATION = 2.0 # How to choose this
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
@@ -17,16 +23,15 @@ class DeMixer:
         print("Loading Pyannote Pipeline (this takes a moment)...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        try:
-            self.diarization = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-community-1"
-            ).to(self.device)
-        except Exception as e:
-            print(f"Error loading Pyannote: {e}")
-            exit()
+        # call api
+        self.client_diarization = Client(key_diarization)
 
         print(f"Pipeline ready on {self.device}")
         self.target_speaker = None
+
+
+        # etape 1: enregistrer la voix
+
 
     def get_diarization(self, audio_buffer):
         """
@@ -35,10 +40,14 @@ class DeMixer:
         # Pyannote expects a Tensor (channels, time)
         audio_tensor = torch.tensor(audio_buffer).float().unsqueeze(0).to(self.device)
 
-        diarization = self.diarization(
-            {"waveform": audio_tensor, "sample_rate": SAMPLE_RATE}
-        )
-        return diarization
+        # submit a diarization job
+        job_id = self.client_diarization.diarize(self.client_diarization.upload(audio_buffer))
+
+        # retrieve diarization
+        diarization = self.client_diarization.retrieve(job_id)
+
+        # this variable is a list of dict
+        return diarization['output']['diarization']
 
     def repair_segment(self, audio_chunk, overlap_mask):
         """
@@ -63,7 +72,8 @@ class DeMixer:
     def process_chunk(self, audio_data):
         audio_data = np.ascontiguousarray(audio_data)
         audio_16k = librosa.resample(audio_data, orig_sr=48000, target_sr=16000)
-        diarization = self.get_diarization(audio_16k)
+
+        segments = self.get_diarization(audio_16k)
 
         ####################################################
         ####### SOME LOGIC TO DEFINE THE MAIN SPEAKER ######
@@ -82,14 +92,7 @@ class DeMixer:
         #####################################
         ### BUILD THE MASK ? ################
         #####################################
-        speaker_count = np.zeros(n_samples, dtype=np.int8)
-        segments = []
-        for turn, speaker in diarization.speaker_diarization:
-            segments.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker
-            })
+
         for i, seg_i in enumerate(segments):
             # only overlaps involving target speaker
             if seg_i["speaker"] != self.target_speaker:
