@@ -99,27 +99,21 @@ class DeMixer:
                 continue
 
             for j, seg_j in enumerate(segments):
-                if i == j:
-                    continue
+                if i != j:
+                    # intersection
+                    overlap_start = max(seg_i["start"], seg_j["start"])
+                    overlap_end = min(seg_i["end"], seg_j["end"])
 
-                # must be a different speaker
-                if seg_j["speaker"] == self.target_speaker:
-                    continue
+                    if overlap_start >= overlap_end:
+                        continue  # no overlap
+                    else:
+                        start_sample = int(overlap_start * SAMPLE_RATE)
+                        end_sample = int(overlap_end * SAMPLE_RATE)
 
-                # intersection
-                overlap_start = max(seg_i["start"], seg_j["start"])
-                overlap_end = min(seg_i["end"], seg_j["end"])
+                        start_sample = max(0, start_sample)
+                        end_sample = min(n_samples, end_sample)
 
-                if overlap_start >= overlap_end:
-                    continue  # no overlap
-
-                start_sample = int(overlap_start * SAMPLE_RATE)
-                end_sample = int(overlap_end * SAMPLE_RATE)
-
-                start_sample = max(0, start_sample)
-                end_sample = min(n_samples, end_sample)
-
-                overlap_mask[start_sample:end_sample] = 1.0
+                        overlap_mask[start_sample:end_sample] = 1.0
 
         assert len(overlap_mask) == len(audio_data)
         final_audio = self.repair_segment(audio_data, overlap_mask)
