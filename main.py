@@ -14,6 +14,7 @@ CHUNK_DURATION = 2.0 # How to choose this
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 THRESHOLD = 0.01    # Voice detection threshold
 RECORD_SECONDS = 5  # 5 second recording for voiceprint acquisition
+TARGET_NAME = "target_name"  # The speaker label you want to assign
 access_key = 'sk_7e7cf9e9186c464bb8fe489b0c21af44'
 overlap_duration = 0.5 # min duration of overlap to run the separation
 
@@ -79,7 +80,7 @@ class DeMixer:
         #     print(f"LOCKED onto Speaker: {self.target_speaker}")
         # else:
         #     self.detect_speaker(diarization)
-        
+
         # Build the Mask
         # We want to keep Target, but process the frames where Target AND Others speak (seperation etc)
         # Or remove frames where ONLY Others speak.
@@ -94,6 +95,106 @@ class DeMixer:
         final_audio = self.repair_segment(audio_data, overlap_mask)
 
         return final_audio
+
+    def target_speaker_detection(self, audio_chunk):
+        # upload conversation file
+        temp_chunck = "temp_chunk.wav"
+        wav_file = wave.open(temp_chunck, 'w')
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)  # 16-bit PCM
+        wav_file.setframerate(SAMPLE_RATE)
+        # Convert float32 -> int16
+        audio_int16 = np.int16(audio_chunk * 32767)
+        wav_file.writeframes(audio_int16.tobytes())
+        wav_file.close()
+        media_url = self.client.upload(temp_chunck)
+        data = {
+            "url": media_url,
+            "voiceprints": [
+                {
+                    "label": TARGET_NAME, # The speaker label you want to assign
+                    "voiceprint": self.target_speaker  # Replace with actual voiceprint
+                },
+                # Add more voiceprints as needed
+            ],
+            # Optional matching parameters
+            "matching": {
+                "threshold": 50,  # Only match if confidence is 50% or higher
+                "exclusive": True  # Prevent multiple speakers matching same voiceprint
+            }
+        }
+
+        import requests
+        url = "https://api.pyannote.ai/v1/identify"
+
+        headers = {"Authorization": f"Bearer {access_key}", "Content-Type": "application/json"}
+
+        response = requests.post(url, headers=headers, json=data)
+
+        if response.status_code != 200:
+            print(f"Error: {response.status_code} - {response.text}")
+        else:
+            print(response.json())
+
+
+        if response.status_code != 200:
+            print("\n❌ API ERROR!")
+            print(f"Status Code: {response.status_code}")
+            print(f"Server Message: {response.text}")
+
+
+        job_id = response.json()['jobId']
+        print(f"Job started: {job_id}")
+
+        # --- 6. WAIT FOR RESULT ---
+        while True:
+            # Check the JOBS endpoint (Same fix as before)
+            job_response = requests.get(
+                f"https://api.pyannote.ai/v1/jobs/{job_id}",
+                headers={"Authorization": f"Bearer {access_key}"}
+            )
+            
+            job_data = job_response.json()
+            
+            if 'status' not in job_data:
+                print("❌ Unexpected response:", job_data)
+                break
+                
+            status = job_data['status']
+
+            if status == "succeeded":
+                print("\n🎉 ANALYSIS COMPLETE!")
+                print("-" * 50)
+                
+                # The results are in output -> identification
+                segments = job_data['output']['identification']
+                
+                found_target = False
+                for segment in segments:
+                    speaker = segment['speaker']
+                    start = segment['start']
+                    end = segment['end']
+                    
+                    # If the AI recognized the voiceprint, 'speaker' will be TARGET_NAME
+                    # If not, it will be generic (SPEAKER_00, SPEAKER_01...)
+                    if speaker == TARGET_NAME:
+                        print(f"🟢 {speaker} found: {start:.1f}s -> {end:.1f}s")
+                        found_target = True
+                    else:
+                        print(f"⚪ Unknown ({speaker}): {start:.1f}s -> {end:.1f}s")
+                
+                if not found_target:
+                    print(f"⚠️ {TARGET_NAME} was not detected in this audio.")
+                    
+                print("-" * 50)
+                break
+                
+            elif status == "failed":
+                print("\n❌ Job failed.")
+                print(job_data)
+                break
+            
+            print("Processing...", end="\r")
 
 
 # --- AUDIO I/O ---
@@ -147,6 +248,7 @@ def main():
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback, dtype="float32"):
         sd.sleep(60_000)  # maximum wait 60 seconds for a speaker
+
     audio_np = np.concatenate(recorded_audio, axis=0)
     # Save temporary WAV
     wav_file = wave.open(TEMP_FILE, 'w')
@@ -163,9 +265,9 @@ def main():
     # Submit embedding job
     job_id = DeMixer.client.voiceprint(media_url)
     # Retrieve embedding
-    embedding_result = DeMixer.client.retrieve(job_id)
+    voiceprint = DeMixer.client.retrieve(job_id)
     # speaker_embed variable
-    DeMixer.target_speaker = embedding_result['output']['voiceprint']
+    DeMixer.target_speaker = voiceprint['output']['voiceprint']
 
     with sd.Stream(
         device=(INPUT_DEV, OUTPUT_DEV),
