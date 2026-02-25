@@ -1,166 +1,197 @@
 import asyncio
 import base64
-import io
 import json
 import os
 import shutil
 import subprocess
-import time
+import uuid
 
-import numpy as np
 import websockets
-from gtts import gTTS
 
-# Configuration
+# --- Configuration ---
 SERVER_URL = "ws://localhost:8000/v1/realtime"
-API_KEY = os.getenv("GRADIUM_API_KEY")
-AUDIO_FILE_PATH = "john_reference.wav"
-AUDIO_FILE_PATH = "cocktail_party_sample.wav"
-OUTPUT_FILENAME = "temp_output.ogg"
+API_KEY = os.getenv("GRADIUM_API_KEY", "dummy-key")
+
+# Input/Output
+INPUT_AUDIO_PATH = "cocktail_party_sample.wav"
+# INPUT_AUDIO_PATH = "Iliass.wav"
+OUTPUT_AUDIO_PATH = "response_audio.ogg"
+
+# Check for ffplay
+HAS_FFPLAY = shutil.which("ffplay") is not None
 
 
-def convert_wav_to_opus_ogg(file_path: str) -> bytes:
-    """Reads a WAV file and converts it to OGG/Opus bytes using FFmpeg."""
+def stream_audio_chunks(file_path: str, chunk_size: int = 4096):
+    """
+    Streams audio directly from FFmpeg as bytes (Generator).
+    Matches the input requirements: 24kHz, Mono, OGG/Opus.
+    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    # FFmpeg command to read file -> resample to 24k -> mono -> encode Opus -> stdout
     command = [
         "ffmpeg",
         "-i",
-        file_path,  # Input file
+        file_path,
         "-af",
-        "apad=pad_dur=2.0",
-        "-ar",
-        "24000",  # Resample to 24kHz (Unmute standard)
-        "-ac",
-        "1",  # Mono
+        "apad=pad_dur=1.5",  # VAD padding
         "-c:a",
-        "libopus",  # Encode to Opus
+        "libopus",
         "-b:a",
-        "24k",  # Bitrate
+        "24k",
+        "-ar",
+        "24000",
+        "-ac",
+        "1",
         "-f",
-        "ogg",  # Output container
-        "pipe:1",  # Write to stdout
+        "ogg",
+        "-v",
+        "error",
+        "pipe:1",  # Output to stdout
     ]
 
-    # Run FFmpeg
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    ogg_bytes, stderr = process.communicate()
+    # Open process with piped stdout
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
 
-    if process.returncode != 0:
-        print(f"❌ FFmpeg Error: {stderr.decode()}")
-        return b""
-
-    return ogg_bytes
-
-
-async def run_client():
-    if not API_KEY:
-        print("❌ Error: GRADIUM_API_KEY is not set.")
-        return
-
-    # --- STEP 1: Prepare Audio ---
-    print(f"Converting '{AUDIO_FILE_PATH}' to OGG/Opus...")
     try:
-        ogg_data = convert_wav_to_opus_ogg(AUDIO_FILE_PATH)
-    except FileNotFoundError as e:
-        print(f"❌ {e}")
-        return
+        while True:
+            # Read exact chunk size from the pipe
+            data = process.stdout.read(chunk_size)
+            if not data:
+                break
+            yield data
+    finally:
+        # Cleanup
+        process.stdout.close()
+        process.wait()
 
-    if not ogg_data:
-        return
-    print(f"   Ready to send {len(ogg_data)} bytes of audio.")
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "openai-beta": "realtime=v1",
+def base64_encode_opus(chunk: bytes) -> str:
+    """
+    Equivalent to the JS logic: base64EncodeOpus(opus)
+    """
+    return base64.b64encode(chunk).decode("utf-8")
+
+
+def create_event(event_type: str, data: dict = None):
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "type": event_type,
     }
+    if data:
+        event.update(data)
+    return event
 
-    print(f"🔌 Connecting to {SERVER_URL}...")
+
+async def get_audio_response():
+    # Clean previous output
+    if os.path.exists(OUTPUT_AUDIO_PATH):
+        os.remove(OUTPUT_AUDIO_PATH)
+
+    headers = {"Authorization": f"Bearer {API_KEY}", "openai-beta": "realtime=v1"}
+
+    print(f"Connecting to {SERVER_URL}...")
     try:
         async with websockets.connect(
             SERVER_URL, extra_headers=headers, subprotocols=["realtime"]
         ) as websocket:
+            print("Connected.")
 
-            print("Connected!")
-
-            # Swallow handshake if present
-            try:
-                await asyncio.wait_for(websocket.recv(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
-
-            print("Streaming audio...")
-
-            # --- STEP 3: Send Audio Chunks ---
-            CHUNK_SIZE = 1920
-            for i in range(0, len(ogg_data), CHUNK_SIZE):
-                chunk = ogg_data[i : i + CHUNK_SIZE]
-
-                # Wrap in JSON event
-                event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("utf-8"),
+            # --- Configure Session ---
+            session_config = {
+                "session": {
+                    "allow_recording": True,
+                    "instructions": {
+                        "type": "constant",
+                        "content": "You are a helpful assistant. Answer briefly.",
+                    },
                 }
+            }
+            await websocket.send(
+                json.dumps(create_event("session.update", session_config))
+            )
+            print("Session configured.")
 
+            # --- Stream Audio ---
+            print(f"🎤 Streaming audio from {INPUT_AUDIO_PATH}...")
+
+            for opus_chunk in stream_audio_chunks(INPUT_AUDIO_PATH):
+                event = create_event(
+                    "input_audio_buffer.append",
+                    {"audio": base64_encode_opus(opus_chunk)},
+                )
                 await websocket.send(json.dumps(event))
-                await asyncio.sleep(0.05)  # Prevent flooding
+                await asyncio.sleep(0.01)
 
-            # --- Commit ---
-            # Tell the AI we are done talking so it processes the audio
-            # await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
-            print("Audio sent! Listening for response...")
-            if not shutil.which("ffplay"):
-                print("⚠️ 'ffplay' not found. Cannot play audio. Install ffmpeg.")
-                player_process = None
-            else:
+            # await websocket.send(json.dumps(create_event("input_audio_buffer.commit")))
+
+            print("Audio stream finished. Waiting for response...")
+
+            # --- Handle Response ---
+            if HAS_FFPLAY:
                 player_process = subprocess.Popen(
                     ["ffplay", "-autoexit", "-nodisp", "-"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            # --- Listen for AI Response ---
+            else:
+                player_process = None
+
             while True:
                 msg = await websocket.recv()
                 data = json.loads(msg)
-                evt = data.get("type")
-                if evt == "response.audio.delta":
-                    print("[AI Audio Stream...]")
-                    # 1. Get Base64 string
+                evt_type = data.get("type")
+
+                if evt_type == "response.audio.delta":
                     b64_string = data.get("delta")
-
                     if b64_string:
-                        # Decode to binary Opus/OGG bytes
                         audio_bytes = base64.b64decode(b64_string)
-
-                        # Append directly to file (we accumulate the stream here)
-                        with open(OUTPUT_FILENAME, "ab") as f:
+                        with open(OUTPUT_AUDIO_PATH, "ab") as f:
                             f.write(audio_bytes)
+                        if player_process:
+                            try:
+                                player_process.stdin.write(audio_bytes)
+                                player_process.stdin.flush()
+                            except BrokenPipeError:
+                                pass
+                        print(".", end="", flush=True)
 
-                        # --- STREAM LOGIC ---
-                        # Write the chunk directly to the player's input pipe
-                        try:
-                            player_process.stdin.write(audio_bytes)
-                            player_process.stdin.flush()  # Force play immediately
-                            print(".", end="", flush=True)
-                        except BrokenPipeError:
-                            print("\n❌ Player closed unexpectedly.")
-                            break
-                elif evt == "response.text.delta":
-                    print(f"🤖 AI: {data.get('delta')}")
-                elif evt == "response.done":
-                    print("Response finished.")
+                elif evt_type == "response.text.delta":
+                    print(f"\nAI: {data.get('delta')}", end="")
+
+                elif evt_type == "conversation.item.input_audio_transcription.delta":
+                    print(f"\nYou: {data.get('delta')}", end="")
+
+                elif evt_type == "error":
+                    error_details = data.get("error", {})
+                    # Check if it's just a warning (like cold starts)
+                    if error_details.get("type") == "warning":
+                        print(
+                            f"\nServer Warning: {error_details.get('message')} (Waiting...)"
+                        )
+                        continue  # Keep listening! Don't break.
+
+                    # Real error -> Stop
+                    print(f"\n❌ Server Error: {data}")
                     break
-                elif evt == "error":
-                    print(f"Server Error: {data}")
+
+                elif evt_type == "response.done":
+                    print("\n✅ Response complete.")
+                    break
+
+            if player_process:
+                player_process.stdin.close()
+                player_process.wait()
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\n❌ Error: {e}")
+
+    if os.path.exists(OUTPUT_AUDIO_PATH):
+        print(f"\n💾 Response saved to: {OUTPUT_AUDIO_PATH}")
 
 
 if __name__ == "__main__":
-    if os.path.exists(OUTPUT_FILENAME):
-        os.remove(OUTPUT_FILENAME)
-    asyncio.run(run_client())
+    asyncio.run(get_audio_response())
